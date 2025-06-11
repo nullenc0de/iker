@@ -95,7 +95,7 @@ FLAWS = {
 
 def welcome():
     logger.info(f"iker v{VERSION} - IPsec VPN Security Scanner")
-    logger.info("By Julio Gomez (jgo@portcullis-security.com), updated by xAI")
+    logger.info("By Julio Gomez (jgo@portcullis-security.com), updated by nullenc0de")
     logger.info("Enhanced IKEv2 detection and modern cryptographic analysis")
 
 def check_privileges() -> bool:
