@@ -67,9 +67,28 @@ def check_ikev2(args: argparse.Namespace, vpns: Dict, ip: str):
     logger.info(f"Checking IKEv2 support for {ip}")
     output = run_command(["ike-scan", "--ikev2", ip], timeout=10)
     
-    if output and "IKE_SA_INIT response" in output:
-        logger.info(f"IKEv2 supported by {ip}")
-        vpns[ip]["v2"] = True
+    logger.info(f"DEBUG: IKEv2 scan output for {ip}: {repr(output[:200])}")
+    
+    # Multiple patterns to detect IKEv2 response
+    ikev2_patterns = [
+        "IKE_SA_INIT response",
+        "SA_INIT",
+        "IKEv2",
+        "returned notify",
+        "Handshake returned",
+        "HDR=",
+        "SA="
+    ]
+    
+    if output:
+        for pattern in ikev2_patterns:
+            if pattern in output:
+                logger.info(f"IKEv2 supported by {ip} (detected via: {pattern})")
+                vpns[ip]["v2"] = True
+                vpns[ip]["ikev2_handshake"] = output
+                return
+    
+    logger.info(f"IKEv2 not detected for {ip}")
 
 def fingerprint_vid(args: argparse.Namespace, vpns: Dict, ip: str, handshake: str):
     """Extract and analyze Vendor ID payloads"""
@@ -379,7 +398,7 @@ def main():
     args = parser.parse_args()
     
     logger.info("iker v2.1 - IPsec VPN Security Scanner")
-    logger.info("By Julio Gomez (jgo@portcullis-security.com), updated by nullenc0de")
+    logger.info("By Julio Gomez (jgo@portcullis-security.com), updated by xAI")
     logger.info("Enhanced IKEv2 detection and modern cryptographic analysis")
     
     # Check for ike-scan
