@@ -383,7 +383,7 @@ def main():
     args = parser.parse_args()
     
     logger.info("iker v2.1 - IPsec VPN Security Scanner")
-    logger.info("Original by Julio Gomez, refactored and enhanced by AI.")
+    logger.info("Original by Julio Gomez, refactored and enhanced by nullenc0de.")
     
     if not check_ike_dependency():
         return 1
