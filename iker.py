@@ -34,16 +34,20 @@ Modifications from v1.1 script:
 from sys import exit, stdout
 from os import geteuid
 import io
+import json
 import subprocess
 import argparse
 import re
+import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import localtime, strftime, sleep
 
 
 ###############################################################################
 
 # iker version
-VERSION = "1.2"
+VERSION = "1.3-enhanced"
 
 # ike-scan full path
 FULLIKESCANPATH = "ike-scan"
@@ -63,13 +67,18 @@ AUTHLIST = []
 # Diffie-Hellman groups: 1, 2 and 5
 GROUPLIST = []
 
-# Full algorithms lists
-FULLENCLIST = ['1', '2', '3', '4', '5', '6', '7/128', '7/192', '7/256', '8', '65001', '65002', '65004', '65005']
-FULLENCLISTv2 = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '12', '13', '14', '15,' '16', '18', '19', '20', '23']
-FULLHASHLIST = ['1', '2', '3', '4', '5', '6']
-FULLHASHLISTv2 = ['1', '2', '3', '4', '5', '6', '7', '8']
-FULLAUTHLIST = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '128', '64221', '64223', '65001', '65003', '65005', '65007', '65009']
-FULLGROUPLIST = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '25', '26', '27', '28', '29', '30']
+# Full algorithms lists - Updated with modern algorithms
+FULLENCLIST = ['1', '2', '3', '4', '5', '6', '7/128', '7/192', '7/256', '8', '9', '12', '13', '20', '28', '65001', '65002', '65004', '65005']
+FULLENCLISTv2 = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '12', '13', '14', '15', '16', '18', '19', '20', '23', '28']
+FULLHASHLIST = ['1', '2', '3', '4', '5', '6', '7', '8']
+FULLHASHLISTv2 = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12']
+FULLAUTHLIST = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '128', '64221', '64223', '65001', '65003', '65005', '65007', '65009']
+FULLGROUPLIST = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '25', '26', '27', '28', '29', '30', '31']
+
+# Modern algorithm classifications
+MODERN_SECURE_ENCS = ['7/256', '20', '28']  # AES-256, ChaCha20
+MODERN_SECURE_HASHES = ['4', '5', '6', '7', '8']  # SHA-256, SHA-384, SHA-512
+MODERN_SECURE_GROUPS = ['14', '15', '16', '17', '18', '19', '20', '21']  # 2048-bit+ and ECC groups
 
 
 # XML Output
@@ -106,7 +115,7 @@ FLAW_AUTH_ELG_ENC = "The following weak authentication method was supported: ElG
 FLAW_AUTH_ELG_ENC_REV = "The following weak authentication method was supported: ElGamel revised encryption"
 FLAW_AUTH_ECDSA_SIG = "The following moderate authentication method was supported: ECDSA signature"
 FLAW_AUTH_ECDSA_SHA256 = "The following moderate authentication method was supported: ECDSA SHA-256"
-FLAW_AUTH_ECDSA_SHA384 = "The following moderate authenti`cation method was supported: ECDSA SHA-384"
+FLAW_AUTH_ECDSA_SHA384 = "The following moderate authentication method was supported: ECDSA SHA-384"
 FLAW_AUTH_ECDSA_SHA512 = "The following moderate authentication method was supported: ECDSA SHA-512"
 FLAW_AUTH_CRACK = "The following weak authentication method was supported: ISPRA CRACK"
 FLAW_AUTH_HYB_RSA = "The following weak authentication method was supported: Hybrid RSA signatures"
@@ -142,6 +151,140 @@ def checkPrivileges():
 
 
 ###############################################################################
+def validateTarget(target):
+	'''Enhanced validation for IP addresses and domain names.
+	@param target The IP address or domain name to validate
+	@return True if valid, False otherwise'''
+	
+	target = target.strip()
+	
+	# Check if it's an IP address
+	try:
+		socket.inet_aton(target)
+		return True
+	except socket.error:
+		pass
+	
+	# Check if it's a valid domain name
+	try:
+		socket.gethostbyname(target)
+		return True
+	except socket.gaierror:
+		pass
+	
+	# Check CIDR notation
+	if '/' in target:
+		try:
+			ip_part, cidr_part = target.split('/')
+			socket.inet_aton(ip_part)
+			cidr = int(cidr_part)
+			return 0 <= cidr <= 32
+		except (ValueError, socket.error):
+			pass
+	
+	return False
+
+
+###############################################################################
+def calculateRiskScore(vpn_data):
+	'''Calculate a risk score based on discovered vulnerabilities.
+	@param vpn_data Dictionary containing VPN analysis results
+	@return Risk score from 0-10'''
+	
+	score = 0
+	
+	if 'transforms' in vpn_data:
+		for transform_data in vpn_data['transforms']:
+			enc, hsh, auth, group = transform_data[0].split(', ')
+			
+			# Encryption scoring
+			if enc in ['1']:  # DES
+				score += 3
+			elif enc in ['5']:  # 3DES
+				score += 2
+			elif enc.startswith('7/128'):  # AES-128
+				score += 0.5
+			
+			# Hash scoring
+			if hsh in ['1']:  # MD5
+				score += 2
+			elif hsh in ['2']:  # SHA1
+				score += 1.5
+			
+			# Group scoring
+			if group in ['1', '2']:  # MODP-768, MODP-1024
+				score += 2
+			elif group in ['5']:  # MODP-1536
+				score += 1
+	
+	if 'aggressive' in vpn_data and vpn_data['aggressive']:
+		score += 2  # Aggressive mode is a significant risk
+	
+	return min(score, 10)  # Cap at 10
+
+
+###############################################################################
+def generateJsonReport(vpns, scan_metadata):
+	'''Generate a structured JSON report.
+	@param vpns Dictionary containing all VPN scan results
+	@param scan_metadata Dictionary containing scan configuration and timing
+	@return JSON string'''
+	
+	report = {
+		"scan_metadata": scan_metadata,
+		"summary": {
+			"total_targets": len(vpns),
+			"vulnerable_targets": sum(1 for v in vpns.values() if calculateRiskScore(v) > 3),
+			"scan_timestamp": strftime("%Y-%m-%d %H:%M:%S", localtime())
+		},
+		"results": {}
+	}
+	
+	for ip, data in vpns.items():
+		risk_score = calculateRiskScore(data)
+		
+		result = {
+			"target": ip,
+			"risk_score": risk_score,
+			"risk_level": "Critical" if risk_score >= 7 else "High" if risk_score >= 5 else "Medium" if risk_score >= 3 else "Low",
+			"vulnerabilities": [],
+			"discovered_services": {}
+		}
+		
+		if 'transforms' in data:
+			result["discovered_services"]["main_mode"] = len(data['transforms'])
+			for transform_data in data['transforms']:
+				enc, hsh, auth, group = transform_data[0].split(', ')
+				vuln = {
+					"type": "weak_cryptography",
+					"encryption": enc,
+					"hash": hsh,
+					"auth_method": auth,
+					"dh_group": group,
+					"transform": transform_data[1]
+				}
+				result["vulnerabilities"].append(vuln)
+		
+		if 'aggressive' in data and data['aggressive']:
+			result["discovered_services"]["aggressive_mode"] = len(data['aggressive'])
+			result["vulnerabilities"].append({
+				"type": "aggressive_mode_enabled",
+				"severity": "high",
+				"description": "IKE Aggressive Mode is enabled and vulnerable to offline attacks"
+			})
+		
+		if 'vid' in data:
+			result["fingerprinting"] = {
+				"vendor_ids": data['vid'],
+				"fingerprint_confidence": "high" if len(data['vid']) > 2 else "medium"
+			}
+		
+		report["results"][ip] = result
+	
+	return json.dumps(report, indent=2)
+
+
+###############################################################################
 def getArguments():
 	'''This method parse the command line.
 	@return the arguments received and a list of targets.'''
@@ -166,11 +309,14 @@ def getArguments():
 	parser.add_argument("-i", "--input", type=str, help="An input file with an IP address/network per line.")
 	parser.add_argument("-o", "--output", type=str, help="An output file to store the results.")
 	parser.add_argument("-x", "--xml", type=str, help="An output file to store the results in XML format. Default: output.xml")
+	parser.add_argument("-j", "--json", type=str, help="An output file to store the results in JSON format for API integration.")
 	parser.add_argument("--encalgs", type=str, default="1 5 7", help="The encryption algorithms to check (1-7). Default: DES(1), 3DES(5), AES(7). Example: --encalgs=\"1 2 3 4 5 6 7/128 7/192 7/256 8\"")
 	parser.add_argument("--hashalgs", type=str, default="1 2", help="The hash algorithms to check. Default: MD5(1) and SHA1(2). Example: --hashalgs=\"1 2 3 4 5 6\"")
 	parser.add_argument("--authmethods", type=str, default="1 3 64221 65001", help="The authorization methods to check. Default: PSK(1), RSA Sig(3), Hybrid(64221), XAUTH(65001). Example: --authmethods=\"1 2 3 4 5 6 7 8 64221 65001\"")
 	parser.add_argument("--kegroups", type=str, default="1 2 5 14", help="The key exchange groups to check. Default: MODP-768(1), MODP-1024(2), MODP-1536(5) and MODP-2048(14). Example: --kegroups=\"1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18\"")
 	parser.add_argument("--fullalgs", action="store_true", help="Equivalent to known sets of encalgs, hashalgs, authmethods and keygroups (NOTE: This may take a while!)")
+	parser.add_argument("--quickscan", action="store_true", help="Perform a quick scan using only the most common weak algorithms (fast but less comprehensive)")
+	parser.add_argument("--modernscan", action="store_true", help="Scan for modern secure algorithms instead of just weak ones")
 	parser.add_argument("--ikepath", type=str, help="The FULL ike-scan path if it is not in the PATH variable and/or the name changed.")
 	parser.add_argument("-c", "--clientids", type=str, help="A file (dictionary) with a client ID per line to enumerate valid client IDs in Aggressive Mode. Default: unset - This test is not launched by default.")
 	parser.add_argument("-n", "--nofingerprint", action="store_true", help="Do not attempt to fingerprint targets.")
@@ -178,20 +324,28 @@ def getArguments():
 	args = parser.parse_args()
 
 	if args.target:
-		if re.search(r'[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+', args.target):  # did not use \d shorthand since it searches ALL UNIX digits and is slower
-			targets.append(args.target)
+		if validateTarget(args.target):
+			targets.append(args.target.strip())
 		else:
-			print("\033[91m[*]\033[0m You need to specify a target in CIDR notation or an input file (-i).")
-			parser.parse_args(["-h"])
+			print("\033[91m[*]\033[0m Invalid target specified: %s" % args.target)
+			print("\033[91m[*]\033[0m Target must be a valid IP address, domain name, or CIDR notation.")
 			exit(1)
 
 	if args.input:
 		try:
 			f = open(args.input, "r")
-			targets.extend(f.readlines())
+			file_targets = f.readlines()
 			f.close()
-		except:
-			print("\033[91m[*]\033[0m The input file specified ('%s') could not be opened." % args.input)
+			
+			for target in file_targets:
+				target = target.strip()
+				if target and not target.startswith('#'):  # Skip empty lines and comments
+					if validateTarget(target):
+						targets.append(target)
+					else:
+						print("\033[93m[*]\033[0m Skipping invalid target from file: %s" % target)
+		except Exception as e:
+			print("\033[91m[*]\033[0m The input file specified ('%s') could not be opened: %s" % (args.input, str(e)))
 
 	if args.output:
 		try:
@@ -269,6 +423,20 @@ def getArguments():
 		HASHLIST = FULLHASHLIST
 		AUTHLIST = FULLAUTHLIST
 		GROUPLIST = FULLGROUPLIST
+	elif args.quickscan:
+		# Quick scan focuses on most common weak algorithms
+		ENCLIST = ['1', '5']  # DES, 3DES
+		HASHLIST = ['1', '2']  # MD5, SHA1
+		AUTHLIST = ['1']  # PSK
+		GROUPLIST = ['1', '2']  # MODP-768, MODP-1024
+		print("\033[92m[*]\033[0m Quick scan mode enabled - testing most common weak algorithms")
+	elif args.modernscan:
+		# Modern scan focuses on current secure algorithms
+		ENCLIST = MODERN_SECURE_ENCS
+		HASHLIST = MODERN_SECURE_HASHES
+		AUTHLIST = ['3', '9', '10', '11']  # RSA, ECDSA variants
+		GROUPLIST = MODERN_SECURE_GROUPS
+		print("\033[92m[*]\033[0m Modern scan mode enabled - testing current secure algorithms")
 
 	return args, targets
 
@@ -668,7 +836,7 @@ def checkAggressive(args, vpns):
 		if "aggressive" not in list(vpns[ip].keys()) or not vpns[ip]["aggressive"]:
 			waitForExit(args, vpns, ip, "aggressive", [])
 		else:
-			waitForexit(args, vpns, ip, "aggressive", vpns[ip]["aggressive"])
+			waitForExit(args, vpns, ip, "aggressive", vpns[ip]["aggressive"])
 
 
 ###############################################################################
@@ -1532,6 +1700,39 @@ def main():
 
 	# 6. Parse the results
 	parseResults(args, vpns, startTime, endTime)
+	
+	# 7. Generate JSON report if requested
+	if hasattr(args, 'json') and args.json:
+		try:
+			scan_metadata = {
+				"iker_version": VERSION,
+				"start_time": startTime,
+				"end_time": endTime,
+				"scan_parameters": {
+					"encryption_algorithms": ENCLIST,
+					"hash_algorithms": HASHLIST,
+					"auth_methods": AUTHLIST,
+					"key_groups": GROUPLIST,
+					"aggressive_mode_tested": True,
+					"fingerprinting_enabled": not args.nofingerprint
+				}
+			}
+			
+			json_report = generateJsonReport(vpns, scan_metadata)
+			
+			with open(args.json, 'w') as f:
+				f.write(json_report)
+			
+			print("\033[92m[*]\033[0m JSON report saved to: %s" % args.json)
+			
+			# Print summary statistics
+			report_data = json.loads(json_report)
+			print("\033[92m[*]\033[0m Scan Summary:")
+			print("\033[92m[*]\033[0m   Total targets: %d" % report_data['summary']['total_targets'])
+			print("\033[92m[*]\033[0m   Vulnerable targets: %d" % report_data['summary']['vulnerable_targets'])
+			
+		except Exception as e:
+			print("\033[91m[*]\033[0m Error generating JSON report: %s" % str(e))
 	
 if __name__ == '__main__':
 	main()
