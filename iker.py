@@ -33,6 +33,7 @@ Modifications from v1.1 script:
 
 from sys import exit, stdout
 from os import geteuid
+import os
 import io
 import json
 import subprocess
@@ -87,8 +88,37 @@ XMLOUTPUT = "iker_output.xml"
 # Client IDs dictionary
 CLIENTIDS = ""
 
+# Hashcat output directory
+HASHCAT_DIR = ""
+
 # Delay between requests
 DELAY = 0
+
+# Default VPN group names for enumeration
+DEFAULT_GROUPS = [
+    "vpn", "VPN", "GroupVPN", "groupvpn", "GROUPVPN",
+    "default", "Default", "DEFAULT",
+    "ipsec", "IPSec", "IPSEC",
+    "remote", "Remote", "REMOTE",
+    "client", "Client", "CLIENT",
+    "mobile", "Mobile", "MOBILE",
+    "users", "Users", "USERS",
+    "employees", "Employees", "staff", "Staff",
+    "admin", "Admin", "test", "Test", "TEST",
+    "guest", "Guest", "partner", "Partner",
+    "vendor", "Vendor", "contractor", "Contractor",
+    # SonicWall specific
+    "WAN GroupVPN", "WANGROUPVPN", "LocalDomain",
+    "NetExtender", "GlobalVPN", "SSLVPN", "SSL-VPN",
+    # Cisco specific
+    "cisco", "Cisco", "CISCO", "anyconnect", "AnyConnect",
+    # Fortinet specific
+    "fortigate", "FortiGate", "fortinet",
+    # Generic
+    "main", "Main", "primary", "Primary",
+    "office", "Office", "home", "Home",
+    "internal", "Internal", "external", "External",
+]
 
 # Flaws:
 FLAW_DISC = "The IKE service could be discovered which should be restricted to only necessary parties"
@@ -297,6 +327,7 @@ def getArguments():
 	global XMLOUTPUT
 	global CLIENTIDS
 	global DELAY
+	global HASHCAT_DIR
 
 	targets = []
 
@@ -318,8 +349,9 @@ def getArguments():
 	parser.add_argument("--quickscan", action="store_true", help="Perform a quick scan using only the most common weak algorithms (fast but less comprehensive)")
 	parser.add_argument("--modernscan", action="store_true", help="Scan for modern secure algorithms instead of just weak ones")
 	parser.add_argument("--ikepath", type=str, help="The FULL ike-scan path if it is not in the PATH variable and/or the name changed.")
-	parser.add_argument("-c", "--clientids", type=str, help="A file (dictionary) with a client ID per line to enumerate valid client IDs in Aggressive Mode. Default: unset - This test is not launched by default.")
+	parser.add_argument("-c", "--clientids", type=str, help="A file (dictionary) with a client ID per line to enumerate valid client IDs in Aggressive Mode. Default: unset - uses built-in DEFAULT_GROUPS list.")
 	parser.add_argument("-n", "--nofingerprint", action="store_true", help="Do not attempt to fingerprint targets.")
+	parser.add_argument("--hashcat-dir", type=str, help="Directory to save hashcat-ready PSK hash files. Default: current directory.")
 
 	args = parser.parse_args()
 
@@ -417,6 +449,15 @@ def getArguments():
 
 	if args.delay:
 		DELAY = args.delay
+
+	if args.hashcat_dir:
+		HASHCAT_DIR = args.hashcat_dir
+		try:
+			import os
+			os.makedirs(HASHCAT_DIR, exist_ok=True)
+			print("\033[92m[*]\033[0m Hashcat output directory: %s" % HASHCAT_DIR)
+		except Exception as e:
+			print("\033[91m[*]\033[0m Could not create hashcat output directory: %s" % str(e))
 
 	if args.fullalgs:
 		ENCLIST = FULLENCLIST
@@ -594,50 +635,46 @@ def checkIKEv2(args, targets, vpns):
 	@param vpns A dictionary to store all the information'''
 
 	printMessage("[*] Checking for IKE version 2 support...", args.output)
-	ips = []
 
 	try:
-		# Check the IKE v2 support
+		# Check the IKE v2 support for each target
 		for target in targets:
 
 			process = launchProcess("%s -2 -M %s" % (FULLIKESCANPATH, target))
 			process.wait()
 
-			ip = None
-			info = ""
+			v2_supported = False
+			ip = target
 
 			for line in io.TextIOWrapper(process.stdout, encoding="utf-8"):
 				if not line.split() or "Starting ike-scan" in line or "Ending ike-scan" in line:
 					continue
 
+				# Get IP from response line
 				if line[0].isdigit():
-
-					if info:
-						printMessage("\033[92m[*]\033[0m IKE version 2 is supported by %s" % ip, args.output)
-						ips.append(ip)
-						if ip in list(vpns.keys()):
-							vpns[ip]["v2"] = True
-						else:
-							printMessage("[*] IKE version 1 support was not identified in this host (%s). iker will not perform more tests against this host." % ip, args.output)
-					else:
-						printMessage("\033[91m[*]\033[0m IKE version 2 is not supported by %s" % target, args.output)
 					ip = line.split()[0]
-					info = line
 
-			if info and ip not in ips:
+				# Check for IKEv2 SA response (indicates IKEv2 is supported)
+				if "SA=" in line:
+					v2_supported = True
+
+			# Report result
+			if v2_supported:
 				printMessage("\033[92m[*]\033[0m IKE version 2 is supported by %s" % ip, args.output)
 				if ip in list(vpns.keys()):
 					vpns[ip]["v2"] = True
 				else:
 					printMessage("[*] IKE version 1 support was not identified in this host (%s). iker will not perform more tests against this host." % ip, args.output)
 			else:
-				printMessage("\033[91m[*]\033[0m IKE version 2 is not supported by %s" % target, args.output)
+				printMessage("\033[91m[*]\033[0m IKE version 2 is NOT supported by %s" % ip, args.output)
+				if ip in list(vpns.keys()):
+					vpns[ip]["v2"] = False
 
-		# Complete those that don't support it
+		# Mark any remaining IPs as not supporting v2
 		for ip in list(vpns.keys()):
-
 			if "v2" not in list(vpns[ip].keys()):
 				vpns[ip]["v2"] = False
+
 	except KeyboardInterrupt:
 		waitForExit(args, vpns, ip, "v2", False)
 
@@ -788,8 +825,15 @@ def checkEncryptionAlgs(args, vpns):
 def checkAggressive(args, vpns):
 	'''This method tries to check if aggressive mode is available. If so,
 	it also store the returned handshake to a text file.
+	Tries with common group IDs from DEFAULT_GROUPS for devices like SonicWall
+	that require a valid group ID for aggressive mode.
 	@param args The command line parameters
 	@param vpns A dictionary to store all the information'''
+
+	from datetime import datetime
+
+	# Quick group IDs to test for aggressive mode detection
+	quick_groups = ["GroupVPN", "vpn", "VPN", "default", "ipsec", "test"]
 
 	try:
 		top = len(ENCLIST) * len(HASHLIST) * len(AUTHLIST) * len(GROUPLIST)
@@ -804,7 +848,15 @@ def checkAggressive(args, vpns):
 					for auth in AUTHLIST:
 						for group in GROUPLIST:
 
-							process = launchProcess("%s -M --aggressive -P%s_handshake.txt --trans=%s,%s,%s,%s %s" % (FULLIKESCANPATH, ip, enc, hsh, auth, group, ip))
+							# Determine hash output path
+							timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+							if HASHCAT_DIR:
+								hash_path = os.path.join(HASHCAT_DIR, "%s_aggressive_%s_%s_%s_%s_%s" % (ip, enc, hsh, auth, group, timestamp))
+							else:
+								hash_path = "%s_handshake_%s" % (ip, timestamp)
+
+							# First try without group ID
+							process = launchProcess("%s -M --aggressive -P%s --trans=%s,%s,%s,%s %s" % (FULLIKESCANPATH, hash_path, enc, hsh, auth, group, ip))
 							process.wait()
 
 							output = io.TextIOWrapper(process.stdout, encoding="utf-8")
@@ -822,12 +874,50 @@ def checkAggressive(args, vpns):
 									transform = line.strip()[4:-1]
 									printMessage("\033[92m[*]\033[0m Aggressive mode supported with transform: %s" % transform, args.output)
 
+							# If no response, try with common group IDs (SonicWall needs this)
+							if not new:
+								for gid in quick_groups:
+									process = launchProcess("%s -M --aggressive -P%s --trans=%s,%s,%s,%s --id=\"%s\" %s" % (FULLIKESCANPATH, hash_path, enc, hsh, auth, group, gid, ip))
+									process.wait()
+
+									output = io.TextIOWrapper(process.stdout, encoding="utf-8")
+
+									info = ""
+									for line in output:
+										if "Starting ike-scan" in line or "Ending ike-scan" in line or line.strip() == "":
+											continue
+
+										info += line + "\n"
+
+										if "SA=" in line:
+											new = True
+											transform = line.strip()[4:-1]
+											printMessage("\033[92m[*]\033[0m Aggressive mode supported with transform: %s (group: %s)" % (transform, gid), args.output)
+											break
+
+									if new:
+										break
+
+									delay(DELAY)
+
 							if new:
 								vpns[ip]["aggressive"].append(("%s, %s, %s, %s" % (enc, hsh, auth, group), transform, info))
 								fingerprintVID(args, vpns, info)
 								# If the backoff could not be fingerprinted before...
 								if not args.nofingerprint and not vpns[ip]["showbackoff"]:
 									fingerprintShowbackoff(args, vpns, vpns[ip]["aggressive"][0][0], ip)
+
+								# Create hashcat-ready file if hash was captured
+								if os.path.exists(hash_path):
+									hashcat_path = hash_path + ".hashcat"
+									try:
+										with open(hash_path, 'r') as f:
+											hash_data = f.read()
+										with open(hashcat_path, 'w') as f:
+											f.write(hash_data)
+										printMessage("    \033[92m[+]\033[0m Hashcat file saved: %s (mode 5400)" % hashcat_path, args.output)
+									except:
+										pass
 
 							current += 1
 							updateProgressBar(top, current, str(enc)+","+str(hsh)+","+str(auth)+","+str(group))
@@ -872,10 +962,11 @@ def enumerateGroupIDCiscoDPD(args, vpns, ip):
 				process = launchProcess("%s --aggressive --trans=%s --id=%s %s" % (FULLIKESCANPATH, vpns[ip]["aggressive"][0][0], cid, ip))
 				process.wait()
 
-				output = io.TextIOWrapper(process.stdout, encoding="utf-8")[1].strip()
+				output_lines = list(io.TextIOWrapper(process.stdout, encoding="utf-8"))
+				output = output_lines[1].strip() if len(output_lines) > 1 else ""
 
 				# Check if the service is still responding
-				msg = sub(r'(HDR=\()[^\)]*(\))', r'\1xxxxxxxxxxx\2', output)
+				msg = re.sub(r'(HDR=\()[^\)]*(\))', r'\1xxxxxxxxxxx\2', output) if output else ""
 				if not msg:
 					cnt += 1
 					if cnt > 3:
@@ -883,7 +974,7 @@ def enumerateGroupIDCiscoDPD(args, vpns, ip):
 						return False
 
 				enc = False
-				for line in output:
+				for line in output_lines:
 					line = str(line)
 					if "dead peer" in line.lower():
 						enc = True
@@ -916,15 +1007,32 @@ def enumerateGroupIDCiscoDPD(args, vpns, ip):
 ###############################################################################
 def enumerateGroupID(args, vpns):
 	'''This method tries to enumerate valid client IDs from a dictionary.
+	If no dictionary is provided, uses DEFAULT_GROUPS.
+	For valid groups, captures PSK hash in hashcat format.
 	@param args The command line parameters
 	@param vpns A dictionary to store all the information'''
 
-	if not args.clientids:
-		return
+	from datetime import datetime
+
+	# Get group list - use file if provided, otherwise DEFAULT_GROUPS
+	group_list = []
+	if args.clientids:
+		try:
+			fdict = open(args.clientids, "r")
+			group_list = [line.strip() for line in fdict if line.strip()]
+			fdict.close()
+			printMessage("\033[92m[*]\033[0m Loaded %d group names from %s" % (len(group_list), args.clientids), args.output)
+		except:
+			printMessage("\033[91m[*]\033[0m Could not read client ID file, using default groups", args.output)
+			group_list = DEFAULT_GROUPS
+	else:
+		group_list = DEFAULT_GROUPS
+		printMessage("\033[92m[*]\033[0m Using %d built-in default group names" % len(group_list), args.output)
 
 	for ip in list(vpns.keys()):
 
 		vpns[ip]["clientids"] = []
+		vpns[ip]["psk_hashes"] = []  # Store captured PSK hashes
 
 		if not len(vpns[ip]["aggressive"]):
 			continue
@@ -943,25 +1051,34 @@ def enumerateGroupID(args, vpns):
 					break
 
 		if done:
-			# if not len(vpns[ip]["clientids"]):
 			continue  # If Cisco DPD enumeration, continue
 
 		#  Try to guess the "unvalid client ID" message
+		def get_response_line(proc):
+			"""Get the second line (index 1) from process output"""
+			lines = list(io.TextIOWrapper(proc.stdout, encoding="utf-8"))
+			if len(lines) > 1:
+				return lines[1].strip()
+			return ""
+
 		process = launchProcess("%s --aggressive --trans=%s --id=badgroupiker123456 %s" % (FULLIKESCANPATH, vpns[ip]["aggressive"][0][0], ip))
 		process.wait()
-		message1 = sub(r'(HDR=\()[^\)]*(\))', r'\1xxxxxxxxxxx\2', io.TextIOWrapper(process.stdout, encoding="utf-8")[1].strip())
+		raw_msg = get_response_line(process)
+		message1 = re.sub(r'(HDR=\()[^\)]*(\))', r'\1xxxxxxxxxxx\2', raw_msg) if raw_msg else ""
 
 		delay(DELAY)
 
 		process = launchProcess("%s --aggressive --trans=%s --id=badgroupiker654321 %s" % (FULLIKESCANPATH, vpns[ip]["aggressive"][0][0], ip))
 		process.wait()
-		message2 = sub(r'(HDR=\()[^\)]*(\))', r'\1xxxxxxxxxxx\2', io.TextIOWrapper(process.stdout, encoding="utf-8")[1].strip())
+		raw_msg = get_response_line(process)
+		message2 = re.sub(r'(HDR=\()[^\)]*(\))', r'\1xxxxxxxxxxx\2', raw_msg) if raw_msg else ""
 
 		delay(DELAY)
 
 		process = launchProcess("%s --aggressive --trans=%s --id=badgroupiker935831 %s" % (FULLIKESCANPATH, vpns[ip]["aggressive"][0][0], ip))
 		process.wait()
-		message3 = sub(r'(HDR=\()[^\)]*(\))', r'\1xxxxxxxxxxx\2', io.TextIOWrapper(process.stdout, encoding="utf-8")[1].strip())
+		raw_msg = get_response_line(process)
+		message3 = re.sub(r'(HDR=\()[^\)]*(\))', r'\1xxxxxxxxxxx\2', raw_msg) if raw_msg else ""
 
 		delay(DELAY)
 
@@ -980,33 +1097,92 @@ def enumerateGroupID(args, vpns):
 			printMessage("\033[91m[*]\033[0m It was not possible to get a common response to invalid client IDs. This test will be skipped.", args.output)
 			return
 
-		# Enumerate users
-		try:
-			fdict = open(args.clientids, "r")
-			cnt = 0
+		# Enumerate groups
+		cnt = 0
+		total = len(group_list)
 
-			for cid in fdict:
-				cid = cid.strip()
+		for idx, cid in enumerate(group_list):
+			cid = cid.strip()
+			if not cid:
+				continue
 
-				process = launchProcess("%s --aggressive --trans=%s --id=%s %s" % (FULLIKESCANPATH, vpns[ip]["aggressive"][0][0], cid, ip))
-				process.wait()
-				msg = sub(r'(HDR=\()[^\)]*(\))', r'\1xxxxxxxxxxx\2', io.TextIOWrapper(process.stdout, encoding="utf-8")[1].strip())
+			# Progress indicator
+			if VERBOSE:
+				stdout.write("\r[*] Testing group %d/%d: %s          " % (idx + 1, total, cid[:30]))
+				stdout.flush()
 
-				if not msg:
-					cnt += 1
-					if cnt > 3:
-						printMessage("\033[91m[*]\033[0m The IKE service cannot be reached; a firewall might filter your IP address. Skippig to the following service...", args.output)
-						break
+			process = launchProcess("%s --aggressive --trans=%s --id=%s %s" % (FULLIKESCANPATH, vpns[ip]["aggressive"][0][0], cid, ip))
+			process.wait()
+			raw_msg = get_response_line(process)
+			msg = re.sub(r'(HDR=\()[^\)]*(\))', r'\1xxxxxxxxxxx\2', raw_msg) if raw_msg else ""
 
-				elif msg != invalidmsg:
-					vpns[ip]["clientids"].append(cid)
-					printMessage("\033[92m[*]\033[0m A potential valid client ID was found: %s" % cid, args.output)
+			if not msg:
+				cnt += 1
+				if cnt > 3:
+					printMessage("\n\033[91m[*]\033[0m The IKE service cannot be reached; a firewall might filter your IP address. Skipping to the following service...", args.output)
+					break
 
-				delay(DELAY)
+			elif msg != invalidmsg:
+				vpns[ip]["clientids"].append(cid)
+				printMessage("\n\033[92m[+]\033[0m VALID GROUP FOUND: %s" % cid, args.output)
 
-			fdict.close()
-		except:
-			pass
+				# Capture PSK hash for this valid group
+				timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+				safe_cid = cid.replace(" ", "_").replace("/", "_")
+
+				# Determine output path
+				if HASHCAT_DIR:
+					hash_path = os.path.join(HASHCAT_DIR, "psk_%s_%s_%s" % (ip, safe_cid, timestamp))
+				else:
+					hash_path = "psk_%s_%s_%s" % (ip, safe_cid, timestamp)
+
+				# Capture hash with -P flag
+				printMessage("    [*] Capturing PSK hash...", args.output)
+				hash_process = launchProcess("%s -A -M --id=\"%s\" -P%s %s" % (FULLIKESCANPATH, cid, hash_path, ip))
+				hash_process.wait()
+
+				if os.path.exists(hash_path):
+					# Read and display hash info
+					try:
+						with open(hash_path, 'r') as f:
+							hash_data = f.read().strip()
+
+						if hash_data:
+							# Extract the final hash (last colon-separated field)
+							parts = hash_data.split(':')
+							if len(parts) >= 9:
+								final_hash = parts[-1]
+								printMessage("    \033[92m[+]\033[0m PSK Hash: %s" % final_hash, args.output)
+
+							# Create hashcat-ready file
+							hashcat_path = hash_path + ".hashcat"
+							with open(hashcat_path, 'w') as f:
+								f.write(hash_data)
+
+							printMessage("    \033[92m[+]\033[0m Hash saved: %s" % hash_path, args.output)
+							printMessage("    \033[92m[+]\033[0m Hashcat file: %s (mode 5400)" % hashcat_path, args.output)
+
+							vpns[ip]["psk_hashes"].append({
+								"group": cid,
+								"hash_file": hash_path,
+								"hashcat_file": hashcat_path,
+								"hash": final_hash if len(parts) >= 9 else hash_data
+							})
+					except Exception as e:
+						printMessage("    \033[91m[*]\033[0m Error reading hash file: %s" % str(e), args.output)
+				else:
+					printMessage("    \033[91m[*]\033[0m Failed to capture PSK hash for group: %s" % cid, args.output)
+
+			delay(DELAY)
+
+		if VERBOSE:
+			stdout.write("\n")
+			stdout.flush()
+
+		# Print summary for this IP
+		if vpns[ip]["psk_hashes"]:
+			printMessage("\n\033[92m[+]\033[0m Captured %d PSK hash(es) for %s" % (len(vpns[ip]["psk_hashes"]), ip), args.output)
+			printMessage("    To crack with hashcat: hashcat -m 5400 <hash_file> <wordlist>", args.output)
 
 
 ###############################################################################
