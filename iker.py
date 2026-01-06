@@ -930,6 +930,180 @@ def checkAggressive(args, vpns):
 
 
 ###############################################################################
+# Common VPN passwords for quick crack attempts
+COMMON_VPN_PASSWORDS = [
+	"vpn", "VPN", "vpn123", "VPN123", "vpn@123", "VPN@123",
+	"password", "Password", "password1", "Password1", "password123",
+	"admin", "Admin", "admin123", "Admin123",
+	"cisco", "Cisco", "cisco123", "Cisco123",
+	"sonicwall", "SonicWall", "sonicwall123",
+	"firewall", "Firewall", "firewall123",
+	"remote", "Remote", "remote123",
+	"access", "Access", "access123",
+	"secret", "Secret", "secret123",
+	"letmein", "welcome", "Welcome",
+	"changeme", "Changeme", "changeme123",
+	"test", "Test", "test123", "Test123",
+	"guest", "Guest", "guest123",
+	"default", "Default", "default123",
+	"123456", "1234567", "12345678", "123456789",
+	"qwerty", "Qwerty123",
+	"company", "Company123",
+	"ipsec", "IPSec", "ipsec123",
+	"tunnel", "Tunnel", "tunnel123",
+	"connect", "Connect", "connect123",
+	"secure", "Secure", "secure123",
+	"private", "Private", "private123",
+]
+
+
+###############################################################################
+def enumerateAuthMethods(args, vpns):
+	'''This method tests different authentication methods to detect MFA support.
+	@param args The command line parameters
+	@param vpns A dictionary to store all the information'''
+
+	# Auth method IDs: 1=PSK, 3=RSA Sig, 5=RSA Enc, 64221=Hybrid, 65001=XAUTH
+	auth_methods = [
+		(1, "PSK (Pre-Shared Key)", False),
+		(65001, "XAUTH PSK", True),  # MFA capable
+		(3, "RSA Signatures", False),
+		(64221, "Hybrid RSA", True),  # MFA capable
+		(65005, "XAUTH RSA", True),  # MFA capable
+	]
+
+	for ip in list(vpns.keys()):
+		if "transforms" not in vpns[ip] or not vpns[ip]["transforms"]:
+			continue
+
+		printMessage("\n[*] Testing authentication methods for %s..." % ip, args.output)
+		vpns[ip]["auth_methods"] = []
+		vpns[ip]["mfa_available"] = False
+
+		# Get a working transform to use as base
+		base_trans = vpns[ip]["transforms"][0][0]
+		parts = base_trans.split(", ")
+		if len(parts) >= 4:
+			enc, hsh, _, grp = parts[0], parts[1], parts[2], parts[3]
+		else:
+			continue
+
+		for auth_id, auth_name, mfa_capable in auth_methods:
+			process = launchProcess("%s -M --trans=%s,%s,%s,%s %s" % (
+				FULLIKESCANPATH, enc, hsh, auth_id, grp, ip))
+			process.wait()
+
+			accepted = False
+			for line in io.TextIOWrapper(process.stdout, encoding="utf-8"):
+				if "SA=" in line:
+					accepted = True
+					break
+
+			if accepted:
+				vpns[ip]["auth_methods"].append((auth_id, auth_name, mfa_capable))
+				if mfa_capable:
+					vpns[ip]["mfa_available"] = True
+					printMessage("    \033[92m[+]\033[0m %s: Accepted (MFA capable)" % auth_name, args.output)
+				else:
+					printMessage("    \033[93m[+]\033[0m %s: Accepted (No MFA)" % auth_name, args.output)
+			else:
+				printMessage("    \033[91m[-]\033[0m %s: Rejected" % auth_name, args.output)
+
+			delay(DELAY)
+
+		# Print MFA summary
+		if not vpns[ip]["mfa_available"]:
+			printMessage("    \033[91m[!]\033[0m WARNING: No multi-factor authentication detected!", args.output)
+		else:
+			printMessage("    \033[92m[+]\033[0m MFA-capable authentication available", args.output)
+
+
+###############################################################################
+def extractVPNIdentity(hash_data):
+	'''Extract VPN Identity from PSK hash data.
+	@param hash_data The raw hash data from ike-scan
+	@return The VPN identity string or None'''
+
+	# Hash format: ...:VPN_ID_HEX:hash1:hash2:hash3
+	# VPN ID is typically in position 5 (0-indexed) as hex
+	try:
+		parts = hash_data.strip().split(':')
+		if len(parts) >= 6:
+			# VPN ID is hex encoded, format like "020000005742494657"
+			# First bytes are type/length, rest is the ID
+			vpn_id_hex = parts[5]
+			if vpn_id_hex.startswith("0"):
+				# Skip first 4 bytes (8 hex chars) which are type/length
+				id_hex = vpn_id_hex[8:]
+				# Convert hex to ASCII
+				vpn_id = bytes.fromhex(id_hex).decode('ascii', errors='ignore').strip('\x00')
+				if vpn_id and vpn_id.isprintable():
+					return vpn_id
+	except:
+		pass
+	return None
+
+
+###############################################################################
+def quickCrack(args, vpns):
+	'''Attempt to crack captured PSK hashes with common passwords.
+	@param args The command line parameters
+	@param vpns A dictionary to store all the information'''
+
+	# Check if psk-crack is available
+	try:
+		proc = subprocess.Popen("which psk-crack", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		proc.wait()
+		if proc.returncode != 0:
+			printMessage("\n[*] psk-crack not found, skipping quick crack attempt", args.output)
+			return
+	except:
+		return
+
+	for ip in list(vpns.keys()):
+		if "psk_hashes" not in vpns[ip] or not vpns[ip]["psk_hashes"]:
+			continue
+
+		printMessage("\n[*] Attempting quick password crack for %s..." % ip, args.output)
+		printMessage("    Testing %d common VPN passwords..." % len(COMMON_VPN_PASSWORDS), args.output)
+
+		for hash_info in vpns[ip]["psk_hashes"]:
+			hash_file = hash_info.get("hash_file", "")
+			group = hash_info.get("group", "unknown")
+
+			if not hash_file or not os.path.exists(hash_file):
+				continue
+
+			# Create temp wordlist
+			temp_wordlist = "/tmp/iker_quick_wordlist.txt"
+			with open(temp_wordlist, 'w') as f:
+				f.write('\n'.join(COMMON_VPN_PASSWORDS))
+
+			# Try psk-crack
+			process = launchProcess("psk-crack -d %s %s 2>/dev/null" % (temp_wordlist, hash_file))
+			process.wait()
+
+			output = process.stdout.read().decode('utf-8', errors='ignore')
+
+			if 'key "' in output.lower() or 'found:' in output.lower():
+				# Extract the password
+				for line in output.split('\n'):
+					if 'key "' in line.lower() or 'found' in line.lower():
+						printMessage("    \033[92m[+]\033[0m PASSWORD CRACKED for group '%s'!" % group, args.output)
+						printMessage("    \033[92m[+]\033[0m %s" % line.strip(), args.output)
+						vpns[ip]["cracked_psk"] = line.strip()
+						break
+			else:
+				printMessage("    [-] No match found for group '%s' with common passwords" % group, args.output)
+
+			# Clean up
+			try:
+				os.remove(temp_wordlist)
+			except:
+				pass
+
+
+###############################################################################
 def enumerateGroupIDCiscoDPD(args, vpns, ip):
 	'''This method tries to enumerate valid client IDs from a dictionary.
 	@param args The command line parameters
@@ -1150,9 +1324,17 @@ def enumerateGroupID(args, vpns):
 						if hash_data:
 							# Extract the final hash (last colon-separated field)
 							parts = hash_data.split(':')
+							final_hash = ""
 							if len(parts) >= 9:
 								final_hash = parts[-1]
 								printMessage("    \033[92m[+]\033[0m PSK Hash: %s" % final_hash, args.output)
+
+							# Extract VPN Identity
+							vpn_id = extractVPNIdentity(hash_data)
+							if vpn_id:
+								printMessage("    \033[92m[+]\033[0m VPN Identity: %s" % vpn_id, args.output)
+								if "vpn_identity" not in vpns[ip]:
+									vpns[ip]["vpn_identity"] = vpn_id
 
 							# Create hashcat-ready file
 							hashcat_path = hash_path + ".hashcat"
@@ -1166,7 +1348,8 @@ def enumerateGroupID(args, vpns):
 								"group": cid,
 								"hash_file": hash_path,
 								"hashcat_file": hashcat_path,
-								"hash": final_hash if len(parts) >= 9 else hash_data
+								"hash": final_hash if len(parts) >= 9 else hash_data,
+								"vpn_identity": vpn_id
 							})
 					except Exception as e:
 						printMessage("    \033[91m[*]\033[0m Error reading hash file: %s" % str(e), args.output)
@@ -1865,11 +2048,17 @@ def main():
 	# 3. Ciphers
 	checkEncryptionAlgs(args, vpns)
 
+	# 3.5 Authentication Methods & MFA Detection
+	enumerateAuthMethods(args, vpns)
+
 	# 4. Aggressive Mode
 	checkAggressive(args, vpns)
 
 	# 5. Enumerate client IDs
 	enumerateGroupID(args, vpns)
+
+	# 6. Quick crack attempt
+	quickCrack(args, vpns)
 
 	endTime = strftime("%a, %d %b %Y %H:%M:%S %Z", localtime())
 	printMessage("iker finished enumerating/brute forcing at %s" % endTime, args.output)
