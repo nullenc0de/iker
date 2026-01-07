@@ -50,8 +50,8 @@ from time import localtime, strftime, sleep
 # iker version
 VERSION = "1.3-enhanced"
 
-# ike-scan full path
-FULLIKESCANPATH = "ike-scan"
+# ike-scan full path (--sport=0 uses random source port to avoid binding to 500)
+FULLIKESCANPATH = "ike-scan --sport=0"
 
 # Verbose flag (default False)
 VERBOSE = False
@@ -96,6 +96,7 @@ DELAY = 0
 
 # Default VPN group names for enumeration
 DEFAULT_GROUPS = [
+    # Generic common names
     "vpn", "VPN", "GroupVPN", "groupvpn", "GROUPVPN",
     "default", "Default", "DEFAULT",
     "ipsec", "IPSec", "IPSEC",
@@ -104,20 +105,93 @@ DEFAULT_GROUPS = [
     "mobile", "Mobile", "MOBILE",
     "users", "Users", "USERS",
     "employees", "Employees", "staff", "Staff",
-    "admin", "Admin", "test", "Test", "TEST",
+    "admin", "Admin", "ADMIN", "ADMINVPN",
+    "test", "Test", "TEST",
     "guest", "Guest", "partner", "Partner",
     "vendor", "Vendor", "contractor", "Contractor",
+
     # SonicWall specific
-    "WAN GroupVPN", "WANGROUPVPN", "LocalDomain",
-    "NetExtender", "GlobalVPN", "SSLVPN", "SSL-VPN",
+    "WAN GroupVPN", "WANGROUPVPN", "WLAN GroupVPN",
+    "LocalDomain", "NetExtender", "GlobalVPN",
+    "SSLVPN", "SSL-VPN", "SonicWALL",
+
     # Cisco specific
-    "cisco", "Cisco", "CISCO", "anyconnect", "AnyConnect",
+    "cisco", "Cisco", "CISCO",
+    "anyconnect", "AnyConnect", "ANYCONNECT",
+    "AnyConnect_Default", "ANYCONNECT_DEFAULT",
+    "ANYConnectGroup", "ANYProfile", "ANYTUNNEL",
+    "AC_Client", "DefaultRAGroup", "DefaultWEBVPNGroup",
+
     # Fortinet specific
-    "fortigate", "FortiGate", "fortinet",
-    # Generic
-    "main", "Main", "primary", "Primary",
-    "office", "Office", "home", "Home",
-    "internal", "Internal", "external", "External",
+    "fortigate", "FortiGate", "fortinet", "Fortinet", "FORTINET",
+    "FortiClient", "FGTVPN",
+
+    # Palo Alto
+    "GP", "GlobalProtect", "GLOBALPROTECT",
+    "PaloAlto", "PAN-GP",
+
+    # CheckPoint
+    "checkpoint", "CheckPoint", "CHECKPOINT",
+    "RemoteAccess", "CPVPN",
+
+    # Juniper
+    "juniper", "Juniper", "JUNIPER",
+    "JuniperVPN", "JNPR",
+
+    # Generic organizational
+    "main", "Main", "MAIN",
+    "primary", "Primary", "PRIMARY",
+    "office", "Office", "OFFICE",
+    "home", "Home", "HOME",
+    "internal", "Internal", "INTERNAL",
+    "external", "External", "EXTERNAL",
+    "corporate", "Corporate", "CORPORATE",
+    "sales", "Sales", "SALES",
+    "engineering", "Engineering", "ENGINEERING",
+    "it", "IT", "ITAdmin", "IT-VPN",
+    "finance", "Finance", "FINANCE",
+    "hr", "HR", "HumanResources",
+    "executive", "Executive", "EXECUTIVE",
+    "management", "Management", "MANAGEMENT",
+
+    # Common patterns from Shodan data
+    "SSLVPN_TUNNEL", "SSL_VPN", "SSLVPN_Users",
+    "Remote_Access", "RemoteUsers", "Remote-Access",
+    "Site-to-Site", "SiteToSite", "S2S",
+    "L2TP", "L2TP-VPN", "PPTP",
+    "IKEv2", "IKEv2-VPN",
+    "MobileVPN", "Mobile-VPN", "MobileUsers",
+    "BYOD", "BYOD-VPN",
+    "Guest-VPN", "GuestAccess", "GuestNetwork",
+    "Contractor-VPN", "ContractorAccess",
+    "Vendor-VPN", "VendorAccess", "ThirdParty",
+    "Partner-VPN", "PartnerAccess",
+    "B2B", "B2B-VPN",
+    "DMZ", "DMZ-VPN",
+    "Extranet", "Extranet-VPN",
+    "Intranet", "Intranet-VPN",
+
+    # Healthcare/specific verticals (from user list)
+    "Aktion VPN", "BMC", "BMC-subs", "BWH-CP",
+    "Dartmouth VPN", "Keene", "MAH", "MIT PM Trailer",
+    "NSMC", "SGMSServer-VPN", "Sommerville", "UMH",
+
+    # Common company patterns
+    "CompanyVPN", "CorpVPN", "Corp-VPN",
+    "MainOffice", "HeadOffice", "HQ", "HQ-VPN",
+    "Branch", "BranchOffice", "Branch-VPN",
+    "DataCenter", "DC-VPN",
+    "Cloud", "CloudVPN", "AWS-VPN", "Azure-VPN",
+    "Backup", "Backup-VPN", "DR", "DR-VPN",
+
+    # Regional patterns
+    "US", "US-VPN", "USA", "USA-VPN",
+    "EU", "EU-VPN", "EMEA", "EMEA-VPN",
+    "APAC", "APAC-VPN", "Asia", "Asia-VPN",
+    "Americas", "Americas-VPN",
+    "East", "West", "North", "South",
+    "NYC", "LA", "CHI", "DAL", "ATL", "BOS", "SEA",
+    "London", "Paris", "Tokyo", "Sydney",
 ]
 
 # Flaws:
@@ -352,6 +426,8 @@ def getArguments():
 	parser.add_argument("-c", "--clientids", type=str, help="A file (dictionary) with a client ID per line to enumerate valid client IDs in Aggressive Mode. Default: unset - uses built-in DEFAULT_GROUPS list.")
 	parser.add_argument("-n", "--nofingerprint", action="store_true", help="Do not attempt to fingerprint targets.")
 	parser.add_argument("--hashcat-dir", type=str, help="Directory to save hashcat-ready PSK hash files. Default: current directory.")
+	parser.add_argument("--stop-on-first", action="store_true", help="Stop group enumeration after finding first valid group (faster)")
+	parser.add_argument("--max-groups", type=int, default=0, help="Maximum number of groups to test (0 = unlimited)")
 
 	args = parser.parse_args()
 
@@ -959,14 +1035,30 @@ COMMON_VPN_PASSWORDS = [
 
 ###############################################################################
 def enumerateAuthMethods(args, vpns):
-	'''This method tests different authentication methods to detect MFA support.
+	'''This method tests different authentication methods in Phase 1 IKE negotiation.
+
+	IMPORTANT NOTE ON MFA DETECTION:
+	There are two ways MFA can be implemented in IKE VPNs:
+
+	1. XAUTH-PSK (Auth Method 65001) - XAUTH negotiated IN Phase 1
+	   - Detectable via ike-scan --trans parameter
+	   - Server announces XAUTH support during SA negotiation
+
+	2. Mode Config XAUTH - XAUTH requested AFTER Phase 1 completes
+	   - NOT detectable without completing Phase 1 and attempting Phase 2
+	   - Server sends TRANSACTION request after IKE SA established
+	   - Common on SonicWall, Cisco, and other enterprise firewalls
+
+	This function tests for Type 1 only. A server may still require XAUTH/MFA
+	via Mode Config even if this test shows "No MFA detected".
+
 	@param args The command line parameters
 	@param vpns A dictionary to store all the information'''
 
 	# Auth method IDs: 1=PSK, 3=RSA Sig, 5=RSA Enc, 64221=Hybrid, 65001=XAUTH
 	auth_methods = [
 		(1, "PSK (Pre-Shared Key)", False),
-		(65001, "XAUTH PSK", True),  # MFA capable
+		(65001, "XAUTH-PSK (Phase 1)", True),  # MFA in Phase 1
 		(3, "RSA Signatures", False),
 		(64221, "Hybrid RSA", True),  # MFA capable
 		(65005, "XAUTH RSA", True),  # MFA capable
@@ -976,9 +1068,9 @@ def enumerateAuthMethods(args, vpns):
 		if "transforms" not in vpns[ip] or not vpns[ip]["transforms"]:
 			continue
 
-		printMessage("\n[*] Testing authentication methods for %s..." % ip, args.output)
+		printMessage("\n[*] Testing Phase 1 authentication methods for %s..." % ip, args.output)
 		vpns[ip]["auth_methods"] = []
-		vpns[ip]["mfa_available"] = False
+		vpns[ip]["phase1_mfa"] = False  # Renamed for clarity
 
 		# Get a working transform to use as base
 		base_trans = vpns[ip]["transforms"][0][0]
@@ -1002,20 +1094,22 @@ def enumerateAuthMethods(args, vpns):
 			if accepted:
 				vpns[ip]["auth_methods"].append((auth_id, auth_name, mfa_capable))
 				if mfa_capable:
-					vpns[ip]["mfa_available"] = True
-					printMessage("    \033[92m[+]\033[0m %s: Accepted (MFA capable)" % auth_name, args.output)
+					vpns[ip]["phase1_mfa"] = True
+					printMessage("    \033[92m[+]\033[0m %s: Accepted (MFA in Phase 1)" % auth_name, args.output)
 				else:
-					printMessage("    \033[93m[+]\033[0m %s: Accepted (No MFA)" % auth_name, args.output)
+					printMessage("    \033[93m[+]\033[0m %s: Accepted" % auth_name, args.output)
 			else:
 				printMessage("    \033[91m[-]\033[0m %s: Rejected" % auth_name, args.output)
 
 			delay(DELAY)
 
-		# Print MFA summary
-		if not vpns[ip]["mfa_available"]:
-			printMessage("    \033[91m[!]\033[0m WARNING: No multi-factor authentication detected!", args.output)
+		# Print MFA summary with important caveat
+		if not vpns[ip]["phase1_mfa"]:
+			printMessage("    \033[93m[!]\033[0m Phase 1 MFA (XAUTH-PSK) not negotiated", args.output)
+			printMessage("    \033[93m[*]\033[0m Note: Server may still require Mode Config XAUTH after PSK auth", args.output)
+			printMessage("    \033[93m[*]\033[0m Full MFA detection requires attempting actual VPN connection", args.output)
 		else:
-			printMessage("    \033[92m[+]\033[0m MFA-capable authentication available", args.output)
+			printMessage("    \033[92m[+]\033[0m MFA-capable authentication negotiated in Phase 1", args.output)
 
 
 ###############################################################################
@@ -1274,16 +1368,21 @@ def enumerateGroupID(args, vpns):
 		# Enumerate groups
 		cnt = 0
 		total = len(group_list)
+		found_count = 0
 
 		for idx, cid in enumerate(group_list):
 			cid = cid.strip()
 			if not cid:
 				continue
 
-			# Progress indicator
-			if VERBOSE:
-				stdout.write("\r[*] Testing group %d/%d: %s          " % (idx + 1, total, cid[:30]))
-				stdout.flush()
+			# Check max-groups limit
+			if args.max_groups > 0 and idx >= args.max_groups:
+				printMessage("\n[*] Reached max-groups limit (%d), stopping enumeration" % args.max_groups, args.output)
+				break
+
+			# Progress indicator - always show so user knows it's working
+			stdout.write("\r[*] Testing group %d/%d: %-30s" % (idx + 1, total, cid[:30]))
+			stdout.flush()
 
 			process = launchProcess("%s --aggressive --trans=%s --id=%s %s" % (FULLIKESCANPATH, vpns[ip]["aggressive"][0][0], cid, ip))
 			process.wait()
@@ -1355,6 +1454,11 @@ def enumerateGroupID(args, vpns):
 						printMessage("    \033[91m[*]\033[0m Error reading hash file: %s" % str(e), args.output)
 				else:
 					printMessage("    \033[91m[*]\033[0m Failed to capture PSK hash for group: %s" % cid, args.output)
+
+				# Check if we should stop after first valid group
+				if args.stop_on_first or args.quickscan:
+					printMessage("\n[*] Found valid group, stopping enumeration (--stop-on-first)", args.output)
+					break
 
 			delay(DELAY)
 
